@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import math
+import tiktoken
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -14,7 +15,7 @@ from torch.nn import functional as F
 #
 # Worked example used below:  B=2, T=4, C=8, nh=2, hs=4
 # GPT-2 small for reference:  C=768, nh=12, hs=64, block_size=1024
-
+device = 'mps'
 
 @dataclass
 class GPTConfig:
@@ -224,36 +225,241 @@ class Block(nn.Module):
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
+	def __init__(self, config):
+		super().__init__()
+		self.config = config
 
-        # Module names mirror HF's GPT-2 so pretrained weights can be loaded by name.
-        self.transformer = nn.ModuleDict(dict(
-            # token embedding:    token id (0..vocab_size-1) -> C-dim vector. weight (vocab_size, C)
-            wte = nn.Embedding(config.vocab_size, config.n_embed),
-            # position embedding: position (0..block_size-1) -> C-dim vector. weight (block_size, C)
-            # Attention itself is order-agnostic; this is how the model knows token order.
-            wpe = nn.Embedding(config.block_size, config.n_embed),
-            # the stack of n_layer transformer Blocks
-            h = nn.ModuleList(Block(config) for _ in range(config.n_layer)),
-            # final LayerNorm (needed because pre-norm leaves the last residual un-normalized)
-            ln_f = nn.LayerNorm(config.n_embed)
-        ))
-        # Language-model head: C -> vocab_size logits (a score for every possible next token).
-        self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
+		# Module names mirror HF's GPT-2 so pretrained weights can be loaded by name.
+		self.transformer = nn.ModuleDict(dict(
+			# token embedding:    token id (0..vocab_size-1) -> C-dim vector. weight (vocab_size, C)
+			wte = nn.Embedding(config.vocab_size, config.n_embed),
+			# position embedding: position (0..block_size-1) -> C-dim vector. weight (block_size, C)
+			# Attention itself is order-agnostic; this is how the model knows token order.
+			wpe = nn.Embedding(config.block_size, config.n_embed),
+			# the stack of n_layer transformer Blocks
+			h = nn.ModuleList(Block(config) for _ in range(config.n_layer)),
+			# final LayerNorm (needed because pre-norm leaves the last residual un-normalized)
+			ln_f = nn.LayerNorm(config.n_embed)
+		))
+		# Language-model head: C -> vocab_size logits (a score for every possible next token).
+		self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
 
 
-cfg = GPTConfig(block_size=8, n_embed=8, n_head=2)
-attn = CausalSelfAttention(cfg)
-x = torch.randn(2, 4, 8)
+	def forward(self, idx):
+		"""
+		Token ids in -> next-token scores out.
+		  idx:    (B, T)    integer token ids (NOT vectors yet)
+		  logits: (B, T, V) V = vocab_size
+		logits[b, t, :] = model's guess for the token at position t+1, having seen
+		tokens 0..t only (causal mask). One forward pass gives T predictions:
+		training uses all of them, generation only needs the last one.
+		"""
+		# idx is shape (B, T)
+		B, T = idx.size()
+		# wpe only has block_size rows, so there is no embedding for position >= block_size.
+		assert T <= self.config.block_size, f"hitting max seq len"
 
-# 1) Print every intermediate shape (add prints inside forward) and check them against the table.
-print(attn(x).shape)  # torch.Size([2, 4, 8])
+		# get token and position embeddings
+		# torch.arange(0, T) -> [0, 1, ..., T-1], one position index per token.
+		#   dtype=torch.long: embedding lookups need integer indices.
+		#   device=idx.device: create it on the same device as the input (cpu/mps/cuda);
+		#                      mixing devices raises an error.
+		pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+		# nn.Embedding is a LOOKUP TABLE: weight has one row per id, emb(ids) returns
+		# those rows. Output shape = input shape + (C,) on the end.
+		pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embed)
+		tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embed)
+		# Broadcasting: (T, C) lines up with the last two dims of (B, T, C) and is reused
+		# for every sequence in the batch (position 3 means the same thing in every row).
+		# Each vector now carries both "which token" and "where it is".
+		x = pos_emb + tok_emb # (B, T, n_embed) position embeddings are broadcasted
 
-# 2) Causality test: changing a future token must not change earlier outputs.
-x2 = x.clone()
-x2[:, 3] = torch.randn(2, 8)          # change only the last token
-y1, y2 = attn(x), attn(x2)
-print(torch.allclose(y1[:, :3], y2[:, :3]))  # True: tokens 0-2 can't see token 3
-print(torch.allclose(y1[:, 3], y2[:, 3]))    # False: token 3 changed
+		# loop over all the transformer blocks
+		# (B, T, C) -> (B, T, C) every time; each Block refines the vectors.
+		for block in self.transformer.h:
+			x = block(x)
+
+		# final layer norm and classifier
+		x = self.transformer.ln_f(x)  # (B, T, C)
+		# lm_head: Linear(C, V). For every position, one score per vocabulary token.
+		# These are LOGITS: raw, unnormalized scores (any real number, not probabilities).
+		logits = self.lm_head(x) # shape (B, T, vocab_size)
+		return logits
+
+
+	@classmethod
+	def from_pretrained(cls, model_type, override_args=None):
+		assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+		override_args = override_args or {} # default to empty dict
+		# only dropout can be overridden see more notes below
+		assert all(k == 'dropout' for k in override_args)
+		from transformers import GPT2LMHeadModel
+		print("loading weights from pretrained gpt: %s" % model_type)
+
+		# n_layer, n_head and n_embd are determined from model_type
+		config_args = {
+			'gpt2':         dict(n_layer=12, n_head=12, n_embed=768),  # 124M params
+			'gpt2-medium':  dict(n_layer=24, n_head=16, n_embed=1024), # 350M params
+			'gpt2-large':   dict(n_layer=36, n_head=20, n_embed=1280), # 774M params
+			'gpt2-xl':      dict(n_layer=48, n_head=25, n_embed=1600), # 1558M params
+		}[model_type]
+		print("forcing vocab_size=50257, block_size=1024, bias=True")
+		config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+		config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
+		
+		# we can override the dropout rate, if desired
+		if 'dropout' in override_args:
+			print(f"overriding dropout rate to {override_args['dropout']}")
+			config_args['dropout'] = override_args['dropout']
+		# create a from-scratch initialized minGPT model
+		config = GPTConfig(**config_args)
+		model = GPT(config)
+		sd = model.state_dict()
+		sd_keys = sd.keys()
+		sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+
+		# init a huggingface/transformers model
+		model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+		sd_hf = model_hf.state_dict()
+
+		# copy while ensuring all of the parameters are aligned and match in names and shapes
+		sd_keys_hf = sd_hf.keys()
+		sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
+		sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+		transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+		# basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+		# this means that we have to transpose these weights when we import them
+		assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+		for k in sd_keys_hf:
+			if any(k.endswith(w) for w in transposed):
+				# special treatment for the Conv1D weights we need to transpose
+				assert sd_hf[k].shape[::-1] == sd[k].shape
+				with torch.no_grad():
+					sd[k].copy_(sd_hf[k].t())
+			else:
+				# vanilla copy over the other parameters
+				assert sd_hf[k].shape == sd[k].shape
+				with torch.no_grad():
+					sd[k].copy_(sd_hf[k])
+
+		return model
+
+
+# =============================================================================
+# GENERATION (autoregressive sampling)
+#
+# INTUITION
+#   GPT's one skill: given tokens, output a probability for EVERY possible next
+#   token. Generation turns that into text by repeating:
+#     1. run the whole sequence through the model
+#     2. keep only the prediction for the LAST position
+#     3. scores -> probabilities (softmax)
+#     4. randomly pick one token according to those probabilities (top-k sampling)
+#     5. append it to the sequence, go to 1
+#   Each new token becomes input for the next step; no planning ahead.
+#
+# RECIPE (memorize this)
+#   forward -> logits[:, -1, :] -> softmax -> topk -> multinomial -> gather -> cat -> repeat
+#
+# Shapes:  B = num_sequences = 5,  T = current length (7 -> 30),  V = vocab_size = 50257
+#
+# LIMITATIONS of this simple loop
+#   - recomputes the whole sequence every step; real inference uses a KV cache
+#     (store each layer's k, v; only process the new token)
+#   - no cropping to block_size: T > 1024 trips the assert in forward
+#     (nanoGPT feeds x[:, -block_size:])
+#   - no stop token: real generation stops a row at <|endoftext|> (id 50256)
+# =============================================================================
+
+# Build our GPT with GPT-2 small sizes and copy OpenAI's trained weights into it.
+model = GPT.from_pretrained('gpt2')
+# Inference mode: turns off Dropout / switches BatchNorm to eval. This model has
+# neither yet, so it's a no-op here, but always do it before generating.
+model.eval()
+# Move all parameters AND buffers (incl. the causal mask) to the device.
+model.to(device)
+
+num_sequences = 5  # generate 5 different continuations in parallel (= B)
+max_tokens = 30    # total length per sequence, INCLUDING the prompt
+
+# --- tokenize the prompt -----------------------------------------------------
+# tiktoken = OpenAI's fast BPE tokenizer. 'gpt2' = the exact 50257-token vocab
+# GPT-2 was trained with (a different tokenizer's ids would be meaningless here).
+enc = tiktoken.get_encoding('gpt2')
+# string -> list of ints. Tokens are word pieces; the leading space is PART of the token:
+#   [15496,  11,  314,  1101,  257,  3303,      2746]
+#    'Hello' ','  ' I'  "'m"   ' a'  ' language' ' model'
+tokens = enc.encode("Hello, I'm a language model")
+# list -> 1-D tensor. long (int64) because these are ids for an embedding lookup.
+tokens = torch.tensor(tokens, dtype=torch.long) # shape (7, )
+# .unsqueeze(0):  insert a size-1 dim at position 0   (7,)   -> (1, 7)  a batch of 1
+# .repeat(5, 1):  tile 5x along dim 0, 1x along dim 1  (1, 7) -> (5, 7)  5 identical rows
+# Same prompt 5 times: each row SAMPLES differently below -> 5 different continuations
+# from one batched forward pass.
+tokens = tokens.unsqueeze(0).repeat(num_sequences, 1) # shape (5, 7)
+# x is the growing sequence, (B, T). Must be on the same device as the model.
+x = tokens.to(device)
+
+# Sampling is random; fixing the seed makes runs reproducible (same seed -> same outputs).
+# The second line seeds the separate CUDA generator; it's ignored when there is no CUDA.
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+
+# --- the loop ----------------------------------------------------------------
+# x.size(1) is T. Each iteration appends exactly 1 token per row -> runs 30 - 7 = 23 times.
+while x.size(1) < max_tokens:
+	# Don't record ops for backprop: no training here, so skip storing intermediates.
+	# Saves a lot of memory and some time. (torch.inference_mode() is a bit faster still.)
+	with torch.no_grad():
+		# Next-token scores for EVERY position.
+		logits = model(x) # (B, T, vocab_size)                    e.g. (5, 7, 50257)
+
+		# Keep only the LAST position: the other T-1 predictions are guesses for
+		# tokens we already have. Integer index -1 (not a slice) DROPS the T dim.
+		logits = logits[:, -1, :] # (B, vocab_size)               (5, 50257)
+
+		# Same softmax as in attention, over the vocab dim:
+		# probs[b, i] = P(next token of sequence b is token i). Each row sums to 1.
+		# (Temperature, not used here: softmax(logits / temp); <1 sharper, >1 more random.)
+		probs = F.softmax(logits, dim=-1) # (B, V)
+
+		# TOP-K SAMPLING. torch.topk(t, k, dim) -> the k largest values along dim
+		# (sorted, largest first) AND the indices where they were found.
+		#   topk_probs[b]:   the 50 highest probabilities for row b      (B, 50)
+		#   topk_indices[b]: which token ids those are                   (B, 50)
+		# Why: 50k tokens each have a tiny probability, but together the junk tail
+		# adds up to a real chance of sampling garbage. Keep only the top 50.
+		#   e.g. probs        = [0.01, 0.40, 0.05, 0.30, 0.20, ...]  (ids 0, 1, 2, 3, 4, ...)
+		#        topk_probs   = [0.40, 0.30, 0.20]                   (k=3 for the example)
+		#        topk_indices = [   1,    3,    4]
+		topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+
+		# torch.multinomial(weights, n): draw n random indices per row, index i chosen
+		# in proportion to weights[i].
+		#   - weights need NOT sum to 1 (top-50 sums to < 1); multinomial renormalizes.
+		#   - returns a POSITION IN THE TOP-50 LIST (0..49), NOT a vocabulary id!
+		#   e.g. P(ix=0) = 0.40/0.90 ~ 44%, P(1) ~ 33%, P(2) ~ 22%; say it draws ix = [[1]]
+		# Why sample instead of argmax (greedy)? Greedy is deterministic (all 5 rows would
+		# be identical) and tends to fall into repetitive loops.
+		ix = torch.multinomial(topk_probs, 1) # (B, 1)
+
+		# Map "position in top-50 list" back to "actual token id".
+		# torch.gather(src, dim, index): output has index's shape, and
+		#   xcol[b, 0] = topk_indices[b, ix[b, 0]]
+		#   e.g. topk_indices[0, 1] = 3  -> xcol = [[3]]
+		# = per-row fancy indexing (each row uses its own index); keeps the (B, 1) shape
+		# that cat needs. Same as topk_indices[torch.arange(B), ix.squeeze(1)] but 2-D.
+		xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+
+		# torch.cat(tensors, dim): join along an EXISTING dim; all other dims must match.
+		# Appends the new token as a new column:
+		#   (B, T) + (B, 1) -> (B, T+1)     each row gets its own sampled token
+		x = torch.cat((x, xcol), dim=1)
+
+# --- decode ------------------------------------------------------------------
+for i in range(num_sequences):
+	# row i, first max_tokens tokens -> (30,); .tolist() -> plain Python ints for tiktoken
+	tokens = x[i, :max_tokens].tolist()
+	# reverse of encode: ids -> text
+	decoded = enc.decode(tokens)
+	print(f'> {decoded}')
