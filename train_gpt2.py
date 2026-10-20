@@ -17,6 +17,12 @@ from torch.nn import functional as F
 # GPT-2 small for reference:  C=768, nh=12, hs=64, block_size=1024
 
 # auto detect device
+# Pick the fastest available backend, falling back to CPU:
+#   'cuda' = NVIDIA GPU, 'mps' = Apple Silicon GPU (Metal Performance Shaders), 'cpu' = always works.
+# Every tensor and the model must live on the SAME device, so this string is passed
+# to .to(device) for the model and every batch.
+# (The hasattr check guards old PyTorch builds that have no torch.backends.mps; to
+#  actually protect anything it would have to come BEFORE is_available() in the `and`.)
 device = 'cpu'
 if torch.cuda.is_available():
 	device = 'cuda'
@@ -34,26 +40,59 @@ class GPTConfig:
 
 
 class DataLoaderLite:
-	def __init__(self, B, T):
-		self.B = B
-		self.T = T
+	"""
+	Minimal data loader: tokenize the whole text file once, then walk through it
+	in consecutive chunks of B*T tokens, wrapping around at the end.
 
+	INTUITION
+	  A language model is trained to predict the NEXT token at every position.
+	  So the targets are just the inputs shifted left by one:
+	    buf = [t0 t1 t2 t3 t4]          (B*T + 1 tokens)
+	    x   = [t0 t1 t2 t3]             buf[:-1]  inputs
+	    y   = [t1 t2 t3 t4]             buf[1:]   targets: y[i] is what should follow x[0..i]
+	  One chunk of B*T+1 tokens gives B*T (input, target) training examples at once.
+
+	With input.txt (tiny Shakespeare): 338,025 tokens; B=4, T=32 -> 2640 batches per epoch.
+	"""
+
+	def __init__(self, B, T):
+		self.B = B  # sequences per batch
+		self.T = T  # tokens per sequence
+
+		# Same GPT-2 tokenizer used for generation; ids must match the model's vocab.
 		enc = tiktoken.get_encoding('gpt2')
 		with open('input.txt') as f:
 			text = f.read()
+		# Whole file -> one long list of token ids, e.g. [5962, 22307, 25, 198, ...]
+		#                                               'First' ' Citizen' ':' '\n'
 		tokens = enc.encode(text)
+		# list of Python ints -> 1-D int64 tensor of shape (N,), N = 338025.
+		# Kept on CPU; each batch is moved to the device in the training loop.
 		self.tokens = torch.tensor(tokens)
 		print(f"loaded {len(self.tokens)} tokens!")
+		# One epoch = one full pass over the data. Integer division drops the leftover tail.
 		print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
 
+		# Index of the first token of the next batch.
 		self.current_position = 0
 
 	def next_batch(self):
+		# Take B*T + 1 consecutive tokens: the +1 is the extra token needed as the
+		# target for the LAST input position.                       (B*T+1,)  e.g. (129,)
 		batch = self.tokens[self.current_position:self.current_position + (self.B*self.T+1)]
+		# Inputs: all but the last token, folded into B rows of T.  (B*T,) -> (B, T)  (4, 32)
+		# .view works because a slice of a 1-D tensor is contiguous. Row b holds tokens
+		# [b*T, (b+1)*T): the rows are consecutive pieces of the text, read left to right.
 		x = batch[:-1].view(self.B, self.T)
+		# Targets: the same tokens shifted by one.                  (B*T,) -> (B, T)  (4, 32)
+		#   y[b, t] = the token that comes right after x[b, t]
 		y = batch[1:].view(self.B, self.T)
 
+		# Advance by B*T, NOT B*T+1: the extra target token is reused as the first
+		# input of the next batch, so no token is ever skipped.
 		self.current_position += self.B*self.T
+		# If the NEXT batch would run past the end of the data, wrap around to the start
+		# (a new epoch). The few leftover tokens at the end are never used.
 		if self.current_position + (self.B*self.T+1) > len(self.tokens):
 			self.current_position = 0
 		return x, y
@@ -102,6 +141,9 @@ class CausalSelfAttention(nn.Module):
 		# its own block of channels; concatenating doesn't mix them. c_proj is
 		# where information from the different heads gets combined.
 		self.c_proj = nn.Linear(config.n_embed, config.n_embed)
+		# Flag attribute (the value 1.0 doesn't matter, only that it EXISTS): tells
+		# GPT._init_weights this layer writes into the residual stream, so its init std
+		# gets scaled down by 1/sqrt(2 * n_layer). See _init_weights for why.
 		self.c_proj.NANOGPT_SCALE_INIT = 1.0
 
 		self.n_head = config.n_head
@@ -222,6 +264,8 @@ class MLP(nn.Module):
 		self.gelu = nn.GELU(approximate='tanh')
 		# Project back down (4C -> C) so the output can be added to the residual.
 		self.c_proj = nn.Linear(4 * config.n_embed, config.n_embed)
+		# Same flag as attn.c_proj: this is the other layer whose output is added to the
+		# residual stream, so it also gets the scaled-down init in GPT._init_weights.
 		self.c_proj.NANOGPT_SCALE_INIT = 1.0
 
 	def forward(self, x):
@@ -279,27 +323,66 @@ class GPT(nn.Module):
 		# Language-model head: C -> vocab_size logits (a score for every possible next token).
 		self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
 
+		# WEIGHT TYING: the input embedding and the output head share ONE weight tensor.
+		#   wte.weight:     (V, C)  row i = vector for token i going IN
+		#   lm_head.weight: (V, C)  nn.Linear(C, V) stores weight as (out, in) = (V, C);
+		#                           logit for token i = x . row i, i.e. a score coming OUT
+		# Same shape, so they can be the same Parameter. This line makes wte point at
+		# lm_head's tensor (wte's original tensor is dropped); a gradient from either
+		# use updates the one shared matrix.
+		# Intuition: tokens that mean similar things should have similar embeddings AND
+		# get similar scores as the next token, so one matrix can serve both roles.
+		# Saves V*C = 50257*768 ~ 38.6M params, ~30% of GPT-2 small's 124M.
+		# (Used by GPT-2 and "Attention Is All You Need"; from Press & Wolf, 2017.)
 		self.transformer.wte.weight = self.lm_head.weight
 
+		# nn.Module.apply(fn): calls fn(m) on EVERY submodule recursively (children first,
+		# then self), so _init_weights sees each Linear, Embedding, LayerNorm, ... once.
 		self.apply(self._init_weights)
 
 	def _init_weights(self, module):
+		"""
+		Re-initialize weights the way GPT-2 did, instead of PyTorch's defaults.
+		LayerNorm isn't handled here: its default (weight=1, bias=0) is already right.
+		"""
 		if isinstance(module, nn.Linear):
+			# GPT-2 uses a fixed std of 0.02. For comparison, 1/sqrt(fan_in) would be
+			# 1/sqrt(768) ~ 0.036 and 1/sqrt(3072) ~ 0.018, so 0.02 is in the same range.
 			std = 0.02
+			# RESIDUAL SCALING. Every Block ADDS to the residual stream twice
+			# (x = x + attn(...), x = x + mlp(...)), so there are 2 * n_layer additions.
+			# Adding N independent things of variance 1 gives variance N (std sqrt(N)),
+			# so the stream's activations would grow with depth:
+			#     x = torch.zeros(768)
+			#     for _ in range(100): x += torch.randn(768)
+			#     x.std()  # ~10 = sqrt(100)
+			# Scaling the std of the layers that write into the stream (the two c_proj's,
+			# flagged with NANOGPT_SCALE_INIT) by 1/sqrt(2 * n_layer) keeps it ~constant.
+			#   n_layer = 12  ->  std = 0.02 * 24**-0.5 ~ 0.0041
 			if hasattr(module, 'NANOGPT_SCALE_INIT'):
 				std *= (2 * self.config.n_layer) ** -0.5
+			# Functions ending in _ modify the tensor in place (here: fill with random values).
 			torch.nn.init.normal_(module.weight, mean=0, std=std)
+			# PyTorch's default bias init is uniform random; GPT-2 starts biases at 0.
 			if module.bias is not None:
 				torch.nn.init.zeros_(module.bias)
 		elif isinstance(module, nn.Embedding):
+			# Token and position embeddings: std 0.02 too (GPT-2 used 0.01 for wpe;
+			# Karpathy keeps 0.02 for simplicity).
+			# Note: wte.weight IS lm_head.weight (tied), so that one tensor gets initialized
+			# twice (once as Embedding, once as Linear), both with std 0.02. Harmless.
 			torch.nn.init.normal_(module.weight, mean=0, std=0.02)
 
 
 	def forward(self, idx, targets=None):
 		"""
 		Token ids in -> next-token scores out.
-		  idx:    (B, T)    integer token ids (NOT vectors yet)
-		  logits: (B, T, V) V = vocab_size
+		  idx:     (B, T)    integer token ids (NOT vectors yet)
+		  targets: (B, T)    optional, the correct next token for every position
+		                     (the y from DataLoaderLite: idx shifted left by one)
+		  returns (logits, loss):
+		    logits: (B, T, V) V = vocab_size
+		    loss:   scalar cross-entropy if targets were given, else None
 		logits[b, t, :] = model's guess for the token at position t+1, having seen
 		tokens 0..t only (causal mask). One forward pass gives T predictions:
 		training uses all of them, generation only needs the last one.
@@ -335,8 +418,23 @@ class GPT(nn.Module):
 		# These are LOGITS: raw, unnormalized scores (any real number, not probabilities).
 		logits = self.lm_head(x) # shape (B, T, vocab_size)
 
+		# Loss only when targets are given (training); generation calls model(x) without them.
 		loss = None
 		if targets is not None:
+			# F.cross_entropy(input, target) expects:
+			#   input:  (N, num_classes) RAW logits (it applies log_softmax internally,
+			#           so do NOT softmax first)
+			#   target: (N,) integer class ids
+			# so flatten batch and time into one dim of N = B*T predictions:
+			#   logits.view(-1, V): (B, T, V) -> (B*T, V)     (4, 32, 50257) -> (128, 50257)
+			#   targets.view(-1):   (B, T)    -> (B*T,)       (4, 32)        -> (128,)
+			#   (-1 = "infer this dim from the others")
+			# For each of the N rows: loss_n = -log(softmax(logits_n)[target_n])
+			#   = -log(probability the model gave to the CORRECT next token)
+			#   right with prob 1 -> loss 0;  prob near 0 -> loss large.
+			# Returns the MEAN over all N, a single number (0-dim tensor).
+			# SANITY CHECK at init: random weights ~ uniform over V tokens, so the loss
+			# should start near -ln(1/V) = ln(50257) ~ 10.8. Much higher = bad init.
 			loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 		return logits, loss
 
@@ -400,6 +498,64 @@ class GPT(nn.Module):
 
 
 # =============================================================================
+# TRAINING
+#
+# INTUITION
+#   Start from random weights. Repeatedly: show the model a batch of text, measure
+#   how wrong its next-token predictions are (loss), compute how each weight should
+#   change to reduce that loss (backprop), and nudge every weight a little (optimizer).
+#
+# RECIPE (memorize this; the order inside the loop matters)
+#   x, y = next_batch() -> .to(device) -> zero_grad() -> logits, loss = model(x, y)
+#        -> loss.backward() -> optimizer.step()
+#
+# Shapes:  B = 4, T = 32  ->  x, y: (4, 32),  logits: (4, 32, 50257),  loss: scalar
+# =============================================================================
+
+# Build our GPT with GPT-2 small sizes (124M params) and RANDOM weights (_init_weights).
+# The commented line would instead load OpenAI's trained GPT-2 weights.
+# model = GPT.from_pretrained('gpt2')
+model = GPT(GPTConfig())
+# For a MODULE, .to() moves parameters + buffers IN PLACE (and returns self), so no
+# reassignment needed. For a TENSOR, .to() returns a NEW tensor (see x, y below).
+model.to(device)
+
+# 4 sequences of 32 tokens per step = 128 next-token predictions per batch.
+train_dataloader = DataLoaderLite(B=4, T=32)
+
+# AdamW = Adam with "decoupled" weight decay (default weight_decay=0.01).
+#   Adam keeps, per parameter, a running mean of gradients (momentum) and of squared
+#   gradients, and scales each update by them, so every weight gets its own effective
+#   step size. Much faster than plain SGD for transformers.
+# model.parameters(): every trainable tensor (the tied wte/lm_head weight counted once;
+# buffers like the causal mask are NOT included).
+# lr=3e-4: a safe default for small/medium transformers.
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for step in range(50):
+	# A fresh batch each step: next 128 consecutive (input, target) pairs from the text.
+	x, y = train_dataloader.next_batch()  # (B, T), (B, T) on CPU
+	# Tensor .to() is NOT in place, so reassign. Data must be on the model's device.
+	x, y = x.to(device), y.to(device)
+	# Gradients ACCUMULATE: backward() does param.grad += new_grad. Without resetting,
+	# this step's gradient would be added to all previous ones. So clear them first.
+	optimizer.zero_grad()
+	# Forward pass: predictions for all B*T positions and the mean cross-entropy loss.
+	logits, loss = model(x, y)  # (B, T, V), scalar
+	# Backprop: walk the computation graph backwards from loss and fill .grad for
+	# EVERY parameter with d(loss)/d(param): "which direction makes the loss go UP".
+	loss.backward()
+	# Update every parameter using its .grad (AdamW rule; roughly param -= lr * step),
+	# i.e. move each weight a little in the direction that makes the loss go DOWN.
+	optimizer.step()
+	# Expect ~10.8 at step 0 (= ln(50257), random guessing), dropping over 50 steps.
+	# Printing the tensor shows device + grad_fn too; loss.item() gives a plain float
+	# (and forces the GPU to finish, which is what you want when timing steps).
+	print(f'step: {step} | loss: {loss}')
+
+# Stop the script here, so the generation code below doesn't run (temporarily disabled).
+import sys; sys.exit(0)
+
+# =============================================================================
 # GENERATION (autoregressive sampling)
 #
 # INTUITION
@@ -424,25 +580,6 @@ class GPT(nn.Module):
 #     (nanoGPT feeds x[:, -block_size:])
 #   - no stop token: real generation stops a row at <|endoftext|> (id 50256)
 # =============================================================================
-
-# Build our GPT with GPT-2 small sizes and copy OpenAI's trained weights into it.
-# model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
-model.to(device)
-
-train_dataloader = DataLoaderLite(B=4, T=32)
-
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for step in range(50):
-	x, y = train_dataloader.next_batch()
-	x, y = x.to(device), y.to(device)
-	optimizer.zero_grad()
-	logits, loss = model(x, y)
-	loss.backward()
-	optimizer.step()
-	print(f'step: {step} | loss: {loss}')
-
-import sys; sys.exit(0)
 
 # Inference mode: turns off Dropout / switches BatchNorm to eval. This model has
 # neither yet, so it's a no-op here, but always do it before generating.
@@ -483,6 +620,8 @@ while x.size(1) < max_tokens:
 	# Saves a lot of memory and some time. (torch.inference_mode() is a bit faster still.)
 	with torch.no_grad():
 		# Next-token scores for EVERY position.
+		# NOTE: forward now returns (logits, loss), so this line needs to become
+		# `logits, _ = model(x)` before generation will work again.
 		logits = model(x) # (B, T, vocab_size)                    e.g. (5, 7, 50257)
 
 		# Keep only the LAST position: the other T-1 predictions are guesses for
