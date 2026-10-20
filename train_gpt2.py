@@ -15,15 +15,22 @@ from torch.nn import functional as F
 #
 # Worked example used below:  B=2, T=4, C=8, nh=2, hs=4
 # GPT-2 small for reference:  C=768, nh=12, hs=64, block_size=1024
-device = 'mps'
+
+# auto detect device
+device = 'cpu'
+if torch.cuda.is_available():
+	device = 'cuda'
+elif torch.backends.mps.is_available() and hasattr(torch.backends, "mps"):
+	device = 'mps'
+print(f"Using device: {device}")
 
 @dataclass
 class GPTConfig:
-    block_size: int = 256  # max context length (max T)
-    vocab_size: int = 65   # number of distinct tokens
-    n_layer: int = 6       # number of transformer Blocks stacked
-    n_head: int = 8        # attention heads per Block
-    n_embed: int = 384     # embedding size C (must be divisible by n_head!)
+    block_size: int = 1024    # max context length (max T)
+    vocab_size: int = 50257   # number of distinct tokens
+    n_layer: int = 12         # number of transformer Blocks stacked
+    n_head: int = 12          # attention heads per Block
+    n_embed: int = 768        # embedding size C (must be divisible by n_head!)
 
 
 class CausalSelfAttention(nn.Module):
@@ -372,7 +379,8 @@ class GPT(nn.Module):
 # =============================================================================
 
 # Build our GPT with GPT-2 small sizes and copy OpenAI's trained weights into it.
-model = GPT.from_pretrained('gpt2')
+# model = GPT.from_pretrained('gpt2')
+model = GPT(GPTConfig())
 # Inference mode: turns off Dropout / switches BatchNorm to eval. This model has
 # neither yet, so it's a no-op here, but always do it before generating.
 model.eval()
