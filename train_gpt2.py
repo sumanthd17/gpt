@@ -252,7 +252,7 @@ class GPT(nn.Module):
 		self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
 
 
-	def forward(self, idx):
+	def forward(self, idx, targets=None):
 		"""
 		Token ids in -> next-token scores out.
 		  idx:    (B, T)    integer token ids (NOT vectors yet)
@@ -291,7 +291,11 @@ class GPT(nn.Module):
 		# lm_head: Linear(C, V). For every position, one score per vocabulary token.
 		# These are LOGITS: raw, unnormalized scores (any real number, not probabilities).
 		logits = self.lm_head(x) # shape (B, T, vocab_size)
-		return logits
+
+		loss = None
+		if targets is not None:
+			loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+		return logits, loss
 
 
 	@classmethod
@@ -381,8 +385,32 @@ class GPT(nn.Module):
 # Build our GPT with GPT-2 small sizes and copy OpenAI's trained weights into it.
 # model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig())
+model.to(device)
 # Inference mode: turns off Dropout / switches BatchNorm to eval. This model has
 # neither yet, so it's a no-op here, but always do it before generating.
+enc = tiktoken.get_encoding('gpt2')
+with open('input.txt') as f:
+	text = f.read()
+
+text = text[:1000]
+tokens = enc.encode(text)
+
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T+1])
+buf = buf.to(device)
+x = buf[:-1].view(B, T)
+y = buf[1:].view(B, T)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for step in range(50):
+	optimizer.zero_grad()
+	logits, loss = model(x, y)
+	loss.backward()
+	optimizer.step()
+	print(f'step: {step} | loss: {loss}')
+
+import sys; sys.exit(0)
+
 model.eval()
 # Move all parameters AND buffers (incl. the causal mask) to the device.
 model.to(device)
