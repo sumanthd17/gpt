@@ -33,6 +33,32 @@ class GPTConfig:
     n_embed: int = 768        # embedding size C (must be divisible by n_head!)
 
 
+class DataLoaderLite:
+	def __init__(self, B, T):
+		self.B = B
+		self.T = T
+
+		enc = tiktoken.get_encoding('gpt2')
+		with open('input.txt') as f:
+			text = f.read()
+		tokens = enc.encode(text)
+		self.tokens = torch.tensor(tokens)
+		print(f"loaded {len(self.tokens)} tokens!")
+		print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+
+		self.current_position = 0
+
+	def next_batch(self):
+		batch = self.tokens[self.current_position:self.current_position + (self.B*self.T+1)]
+		x = batch[:-1].view(self.B, self.T)
+		y = batch[1:].view(self.B, self.T)
+
+		self.current_position += self.B*self.T
+		if self.current_position + (self.B*self.T+1) > len(self.tokens):
+			self.current_position = 0
+		return x, y
+
+
 class CausalSelfAttention(nn.Module):
     """
     Multi-head causal self-attention.
@@ -388,21 +414,25 @@ model = GPT(GPTConfig())
 model.to(device)
 # Inference mode: turns off Dropout / switches BatchNorm to eval. This model has
 # neither yet, so it's a no-op here, but always do it before generating.
-enc = tiktoken.get_encoding('gpt2')
-with open('input.txt') as f:
-	text = f.read()
+# enc = tiktoken.get_encoding('gpt2')
+# with open('input.txt') as f:
+# 	text = f.read()
 
-text = text[:1000]
-tokens = enc.encode(text)
+# text = text[:1000]
+# tokens = enc.encode(text)
 
-B, T = 4, 32
-buf = torch.tensor(tokens[:B*T+1])
-buf = buf.to(device)
-x = buf[:-1].view(B, T)
-y = buf[1:].view(B, T)
+# B, T = 4, 32
+# buf = torch.tensor(tokens[:B*T+1])
+# buf = buf.to(device)
+# x = buf[:-1].view(B, T)
+# y = buf[1:].view(B, T)
+
+train_dataloader = DataLoaderLite(B=4, T=32)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for step in range(50):
+	x, y = train_dataloader.next_batch()
+	x, y = x.to(device), y.to(device)
 	optimizer.zero_grad()
 	logits, loss = model(x, y)
 	loss.backward()
