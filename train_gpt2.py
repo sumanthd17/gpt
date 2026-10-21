@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 import math
+import time
+import inspect
 import tiktoken
 import torch
 import torch.nn as nn
@@ -193,41 +195,42 @@ class CausalSelfAttention(nn.Module):
 		q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
 		v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
 
-		# Attention scores. THE ONLY PLACE TOKENS INTERACT.
-		#   k.transpose(-2, -1): (B, nh, T, hs) -> (B, nh, hs, T)  (transpose last 2 dims)
-		#   q @ k^T: per (b, h): (T, hs) @ (hs, T) = (T, T)
-		#            -> (B, nh, T, T)                               (2, 2, 4, 4)
-		#   attn[b, h, i, j] = q[b,h,i,:] . k[b,h,j,:] = how much token i "likes" token j
-		#
-		# Scale by 1/sqrt(hs): if q, k entries have variance 1, their dot product
-		# (sum of hs products) has variance hs -> std sqrt(hs). Big logits make
-		# softmax nearly one-hot -> vanishing gradients. Dividing restores var ~1.
-		# k.size(-1) == hs.
-		attn = (q @ k.transpose(-2, -1)) * (1 / math.sqrt(k.size(-1)))  # (B, nh, T, T)
+		# # Attention scores. THE ONLY PLACE TOKENS INTERACT.
+		# #   k.transpose(-2, -1): (B, nh, T, hs) -> (B, nh, hs, T)  (transpose last 2 dims)
+		# #   q @ k^T: per (b, h): (T, hs) @ (hs, T) = (T, T)
+		# #            -> (B, nh, T, T)                               (2, 2, 4, 4)
+		# #   attn[b, h, i, j] = q[b,h,i,:] . k[b,h,j,:] = how much token i "likes" token j
+		# #
+		# # Scale by 1/sqrt(hs): if q, k entries have variance 1, their dot product
+		# # (sum of hs products) has variance hs -> std sqrt(hs). Big logits make
+		# # softmax nearly one-hot -> vanishing gradients. Dividing restores var ~1.
+		# # k.size(-1) == hs.
+		# attn = (q @ k.transpose(-2, -1)) * (1 / math.sqrt(k.size(-1)))  # (B, nh, T, T)
 
-		# Causal masking.
-		#   self.bias[:, :, :T, :T]: top-left TxT corner -> (1, 1, T, T)
-		#     (buffer is block_size x block_size, but the current T may be smaller,
-		#      e.g. during generation T grows from 1)
-		#   == 0: bool mask, True above the diagonal (j > i = future tokens)
-		#   masked_fill(mask, val): returns a NEW tensor with val where mask is True
-		#     (masked_fill_ with underscore = in-place). Mask broadcasts over B and nh.
-		#   Why -inf and not 0: softmax does exp(score); exp(-inf) = 0 -> zero weight.
-		#   exp(0) = 1 would still give the future a positive weight.
-		#   e.g. row i=1: [0.3, 1.2, -inf, -inf]
-		attn = attn.masked_fill(self.bias[:,:, :T, :T] == 0, float('-inf'))  # (B, nh, T, T)
+		# # Causal masking.
+		# #   self.bias[:, :, :T, :T]: top-left TxT corner -> (1, 1, T, T)
+		# #     (buffer is block_size x block_size, but the current T may be smaller,
+		# #      e.g. during generation T grows from 1)
+		# #   == 0: bool mask, True above the diagonal (j > i = future tokens)
+		# #   masked_fill(mask, val): returns a NEW tensor with val where mask is True
+		# #     (masked_fill_ with underscore = in-place). Mask broadcasts over B and nh.
+		# #   Why -inf and not 0: softmax does exp(score); exp(-inf) = 0 -> zero weight.
+		# #   exp(0) = 1 would still give the future a positive weight.
+		# #   e.g. row i=1: [0.3, 1.2, -inf, -inf]
+		# attn = attn.masked_fill(self.bias[:,:, :T, :T] == 0, float('-inf'))  # (B, nh, T, T)
 
-		# Softmax over dim=-1 (the keys j): each query row i becomes a probability
-		# distribution over the tokens it may see. Every row sums to 1.
-		#   [0.3, 1.2, -inf, -inf] -> [0.29, 0.71, 0.0, 0.0]
-		# Row 0 is always [1, 0, 0, ...]: the first token can only see itself.
-		attn = F.softmax(attn, dim=-1)  # (B, nh, T, T)
+		# # Softmax over dim=-1 (the keys j): each query row i becomes a probability
+		# # distribution over the tokens it may see. Every row sums to 1.
+		# #   [0.3, 1.2, -inf, -inf] -> [0.29, 0.71, 0.0, 0.0]
+		# # Row 0 is always [1, 0, 0, ...]: the first token can only see itself.
+		# attn = F.softmax(attn, dim=-1)  # (B, nh, T, T)
 
-		# Weighted sum of values.
-		#   per (b, h): (T, T) @ (T, hs) = (T, hs)
-		#   y[b,h,i,:] = sum_j attn[b,h,i,j] * v[b,h,j,:]
-		#   e.g. token 1 gets 0.29*v_0 + 0.71*v_1
-		y = attn @ v  # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)   (2, 2, 4, 4)
+		# # Weighted sum of values.
+		# #   per (b, h): (T, T) @ (T, hs) = (T, hs)
+		# #   y[b,h,i,:] = sum_j attn[b,h,i,j] * v[b,h,j,:]
+		# #   e.g. token 1 gets 0.29*v_0 + 0.71*v_1
+		# y = attn @ v  # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)   (2, 2, 4, 4)
+		y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
 		# Merge heads back (reverse of the split above).
 		#   .transpose(1, 2):  (B, nh, T, hs) -> (B, T, nh, hs)         (2, 4, 2, 4)
@@ -374,6 +377,30 @@ class GPT(nn.Module):
 			torch.nn.init.normal_(module.weight, mean=0, std=0.02)
 
 
+	def configure_optimizer(self, weight_decay, learning_rate, device):
+		param_dict = {pn:p for pn, p in model.named_parameters()}
+		param_dict = {pn:p for pn, p in param_dict.items() if p.requires_grad}
+
+		decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
+		no_decay_params = [p for _, p in param_dict.items() if p.dim() < 2]
+
+		optim_groups = [
+			{'params': decay_params, 'weight_decay': weight_decay},
+			{'params': no_decay_params, 'weight_decay': 0.0}
+		]
+		num_decay_params = sum(p.numel() for p in decay_params)
+		num_nondecay_params = sum(p.numel() for p in no_decay_params)
+		print(f'num decayed param tensor: {len(decay_params)} with parms: {num_decay_params}')
+		print(f'num non decay param tensors: {len(no_decay_params)} with params: {num_nondecay_params}')
+
+		fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+		use_fused = fused_available and 'cuda' in device
+		print(f'using fused AdamW: {use_fused}')
+		optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+		return optimizer
+
+
+
 	def forward(self, idx, targets=None):
 		"""
 		Token ids in -> next-token scores out.
@@ -515,13 +542,15 @@ class GPT(nn.Module):
 # Build our GPT with GPT-2 small sizes (124M params) and RANDOM weights (_init_weights).
 # The commented line would instead load OpenAI's trained GPT-2 weights.
 # model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 # For a MODULE, .to() moves parameters + buffers IN PLACE (and returns self), so no
 # reassignment needed. For a TENSOR, .to() returns a NEW tensor (see x, y below).
 model.to(device)
+model = torch.compile(model)
 
 # 4 sequences of 32 tokens per step = 128 next-token predictions per batch.
-train_dataloader = DataLoaderLite(B=4, T=32)
+train_dataloader = DataLoaderLite(B=8, T=256)
+torch.set_float32_matmul_precision('high')
 
 # AdamW = Adam with "decoupled" weight decay (default weight_decay=0.01).
 #   Adam keeps, per parameter, a running mean of gradients (momentum) and of squared
@@ -530,8 +559,27 @@ train_dataloader = DataLoaderLite(B=4, T=32)
 # model.parameters(): every trainable tensor (the tied wte/lm_head weight counted once;
 # buffers like the causal mask are NOT included).
 # lr=3e-4: a safe default for small/medium transformers.
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for step in range(50):
+
+max_lr = 6e-4
+min_lr = 0.1 * 6e-4
+warmup_steps = 10
+max_steps = 50
+def get_lr(step):
+	if step < warmup_steps:
+		return (max_lr * (step+1)) / warmup_steps
+	elif step > max_steps:
+		return min_lr
+	else:
+		decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+		assert 0 <= decay_ratio <= 1
+		coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+		return min_lr + coeff * (max_lr - min_lr)
+
+
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
+for step in range(max_steps):
+	t0 = time.time()
 	# A fresh batch each step: next 128 consecutive (input, target) pairs from the text.
 	x, y = train_dataloader.next_batch()  # (B, T), (B, T) on CPU
 	# Tensor .to() is NOT in place, so reassign. Data must be on the model's device.
@@ -540,17 +588,27 @@ for step in range(50):
 	# this step's gradient would be added to all previous ones. So clear them first.
 	optimizer.zero_grad()
 	# Forward pass: predictions for all B*T positions and the mean cross-entropy loss.
-	logits, loss = model(x, y)  # (B, T, V), scalar
+	with torch.autocast(device_type=device, dtype=torch.bfloat16):
+		logits, loss = model(x, y)  # (B, T, V), scalar
 	# Backprop: walk the computation graph backwards from loss and fill .grad for
 	# EVERY parameter with d(loss)/d(param): "which direction makes the loss go UP".
 	loss.backward()
+	norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+	lr = get_lr(step)
+	for param_grp in optimizer.param_groups:
+		param_grp['lr'] = lr
 	# Update every parameter using its .grad (AdamW rule; roughly param -= lr * step),
 	# i.e. move each weight a little in the direction that makes the loss go DOWN.
 	optimizer.step()
 	# Expect ~10.8 at step 0 (= ln(50257), random guessing), dropping over 50 steps.
 	# Printing the tensor shows device + grad_fn too; loss.item() gives a plain float
 	# (and forces the GPU to finish, which is what you want when timing steps).
-	print(f'step: {step} | loss: {loss}')
+	torch.mps.synchronize()
+	t1 = time.time()
+	step_time = (t1-t0)*1000
+	tps = (train_dataloader.B * train_dataloader.T) / step_time
+	print(f'step: {step} | loss: {loss:.5f} | lr: {lr:.5f} | norm: {norm:.4f} | step time: {step_time:.2f}s | tps: {tps:.2f}')
 
 # Stop the script here, so the generation code below doesn't run (temporarily disabled).
 import sys; sys.exit(0)
