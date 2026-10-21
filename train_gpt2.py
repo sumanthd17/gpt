@@ -23,12 +23,12 @@ from torch.nn import functional as F
 #   'cuda' = NVIDIA GPU, 'mps' = Apple Silicon GPU (Metal Performance Shaders), 'cpu' = always works.
 # Every tensor and the model must live on the SAME device, so this string is passed
 # to .to(device) for the model and every batch.
-# (The hasattr check guards old PyTorch builds that have no torch.backends.mps; to
-#  actually protect anything it would have to come BEFORE is_available() in the `and`.)
+# (The hasattr check guards old PyTorch builds that have no torch.backends.mps. It comes
+#  FIRST in the `and`, so is_available() is never reached when mps doesn't exist.)
 device = 'cpu'
 if torch.cuda.is_available():
 	device = 'cuda'
-elif torch.backends.mps.is_available() and hasattr(torch.backends, "mps"):
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 	device = 'mps'
 print(f"Using device: {device}")
 
@@ -407,9 +407,9 @@ class GPT(nn.Module):
 		# name -> parameter, e.g. 'transformer.h.0.attn.c_attn.weight' -> tensor (2304, 768)
 		# named_parameters() lists a SHARED tensor once, so the tied wte/lm_head weight
 		# appears once (under 'transformer.wte.weight').
-		# NOTE: this reads the GLOBAL `model`, not `self`. It works only because a global
-		# `model` happens to exist; `self.named_parameters()` is what's meant.
-		param_dict = {pn:p for pn, p in model.named_parameters()}
+		# Use `self`, not the global `model`: the method must work on whatever GPT
+		# instance it's called on.
+		param_dict = {pn:p for pn, p in self.named_parameters()}
 		# Keep only trainable parameters (frozen ones have requires_grad=False).
 		param_dict = {pn:p for pn, p in param_dict.items() if p.requires_grad}
 
@@ -583,10 +583,13 @@ class GPT(nn.Module):
 #   change to reduce that loss (backprop), and nudge every weight a little (optimizer).
 #
 # RECIPE (memorize this; the order inside the loop matters)
-#   x, y = next_batch() -> .to(device) -> zero_grad()
+#   zero_grad()
+#   -> repeat grad_accum times:                       (gradient accumulation)
+#        x, y = next_batch() -> .to(device)
 #        -> with autocast: logits, loss = model(x, y)
-#        -> loss.backward() -> clip_grad_norm_ -> set lr from schedule -> optimizer.step()
-#        -> synchronize -> time it
+#        -> loss / grad_accum -> loss.backward()      (grads ADD UP across micro-steps)
+#   -> clip_grad_norm_ -> set lr from schedule -> optimizer.step()   (ONE update)
+#   -> synchronize -> time it
 #
 # SPEED-UPS used here (same math, faster on the hardware)
 #   - vocab_size 50304 instead of 50257 ("nice" number for GPU kernels)
@@ -602,6 +605,7 @@ class GPT(nn.Module):
 #   - learning rate: linear warmup, then cosine decay to 10% of max
 #
 # Shapes:  B = 8, T = 256  ->  x, y: (8, 256),  logits: (8, 256, 50304),  loss: scalar
+#          per optimizer step: grad_accum = 16 micro-batches x 2048 tokens = 32768 tokens
 # =============================================================================
 
 # Build our GPT with GPT-2 small sizes (124M params) and RANDOM weights (_init_weights).
@@ -625,8 +629,34 @@ model.to(device)
 # keys get an '_orig_mod.' prefix.
 model = torch.compile(model)
 
-# 8 sequences of 256 tokens per step = 2048 next-token predictions per batch.
-train_dataloader = DataLoaderLite(B=8, T=256)
+# GRADIENT ACCUMULATION: simulate a big batch that doesn't fit in memory.
+#
+# INTUITION
+#   GPT-3 small trained with ~0.5M tokens per optimizer step (524288 = 2**19).
+#   A bigger batch = a less noisy gradient estimate = steadier updates. But B*T
+#   tokens must fit in GPU memory at once (activations for backward grow with B*T).
+#   Trick: run several small "micro-batches" one after another, let their gradients
+#   ADD UP in .grad (backward() does param.grad += ...), and only then take ONE
+#   optimizer step. Mathematically the same as one big batch, just slower.
+#
+#   batch_size (tokens per optimizer step) = B * T * grad_accum
+#   32768 = 8 * 256 * 16
+#
+# batch_size is measured in TOKENS, not sequences. 32768 = 2**15, a smaller stand-in
+# that runs in reasonable time on a laptop.
+batch_size = 32768 # 524288 for GPT-3 small
+B = 8      # micro-batch: sequences per forward/backward pass (limited by memory)
+T = 256    # tokens per sequence
+# Check: the big batch splits into a whole number of micro-batches.
+# The parentheses matter! % and * have equal precedence and run left to right, so
+# `batch_size % B*T` would compute (batch_size % B) * T and only check divisibility by B.
+assert batch_size % (B*T) == 0, "make sure batch size is divisible by B*T"
+# Number of micro-batches per optimizer step: 32768 // 2048 = 16.
+grad_accum = batch_size // (B*T)
+print(f"total desired batch size: {batch_size}")
+print(f"total grad accumulation steps: {grad_accum}")
+# Each next_batch() call returns one micro-batch of 8 x 256 = 2048 tokens.
+train_dataloader = DataLoaderLite(B=B, T=T)
 # Default precision for float32 matmuls is 'highest' (true fp32). 'high' allows TF32 on
 # NVIDIA GPUs (Ampere and newer): same 8-bit exponent (same range), 10-bit mantissa
 # (less precision), much faster tensor-core matmuls. Mostly a CUDA setting.
@@ -683,31 +713,53 @@ optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, devi
 for step in range(max_steps):
 	# Start the stopwatch for this step (seconds since 1970, as a float).
 	t0 = time.time()
-	# A fresh batch each step: next 2048 consecutive (input, target) pairs from the text.
-	x, y = train_dataloader.next_batch()  # (B, T), (B, T) on CPU
-	# Tensor .to() is NOT in place, so reassign. Data must be on the model's device.
-	x, y = x.to(device), y.to(device)
 	# Gradients ACCUMULATE: backward() does param.grad += new_grad. Without resetting,
 	# this step's gradient would be added to all previous ones. So clear them first.
+	# Cleared ONCE per optimizer step, NOT per micro-step: within a step we WANT the
+	# micro-batches' gradients to add up.
 	optimizer.zero_grad()
-	# Forward pass: predictions for all B*T positions and the mean cross-entropy loss.
-	# MIXED PRECISION with torch.autocast: inside this block, ops that are safe in lower
-	# precision (matmuls, i.e. Linear layers and attention) run in bfloat16; ops that
-	# need precision (softmax, LayerNorm, the loss) stay in float32. Autocast decides
-	# per op. The PARAMETERS stay float32; only the computations are cast.
-	#   float32:  1 sign, 8 exponent, 23 mantissa bits
-	#   bfloat16: 1 sign, 8 exponent,  7 mantissa bits
-	# Same exponent = same RANGE as fp32 (no overflow/underflow), just less precision.
-	# Half the bytes -> half the memory traffic and much faster matmul hardware.
-	# (float16 has only 5 exponent bits, so it needs a GradScaler to avoid tiny
-	#  gradients rounding to 0; bfloat16 doesn't.)
-	# Only the forward pass goes inside; backward runs outside and uses matching dtypes.
-	# logits come out as bfloat16.
-	with torch.autocast(device_type=device, dtype=torch.bfloat16):
-		logits, loss = model(x, y)  # (B, T, V), scalar
-	# Backprop: walk the computation graph backwards from loss and fill .grad for
-	# EVERY parameter with d(loss)/d(param): "which direction makes the loss go UP".
-	loss.backward()
+	# Running total of the loss over the micro-steps, only for printing.
+	# Starts as a Python float; becomes a 0-dim tensor after the first +=.
+	loss_accum = 0.0
+	# 16 forward + backward passes, each on a different micro-batch, then ONE update below.
+	for micro_step in range(grad_accum):
+		# A fresh micro-batch each time: next 2048 consecutive (input, target) pairs from the text.
+		x, y = train_dataloader.next_batch()  # (B, T), (B, T) on CPU
+		# Tensor .to() is NOT in place, so reassign. Data must be on the model's device.
+		x, y = x.to(device), y.to(device)
+		# Forward pass: predictions for all B*T positions and the mean cross-entropy loss.
+		# MIXED PRECISION with torch.autocast: inside this block, ops that are safe in lower
+		# precision (matmuls, i.e. Linear layers and attention) run in bfloat16; ops that
+		# need precision (softmax, LayerNorm, the loss) stay in float32. Autocast decides
+		# per op. The PARAMETERS stay float32; only the computations are cast.
+		#   float32:  1 sign, 8 exponent, 23 mantissa bits
+		#   bfloat16: 1 sign, 8 exponent,  7 mantissa bits
+		# Same exponent = same RANGE as fp32 (no overflow/underflow), just less precision.
+		# Half the bytes -> half the memory traffic and much faster matmul hardware.
+		# (float16 has only 5 exponent bits, so it needs a GradScaler to avoid tiny
+		#  gradients rounding to 0; bfloat16 doesn't.)
+		# Only the forward pass goes inside; backward runs outside and uses matching dtypes.
+		# logits come out as bfloat16.
+		with torch.autocast(device_type=device, dtype=torch.bfloat16):
+			logits, loss = model(x, y)  # (B, T, V), scalar
+		# SCALE THE LOSS. cross_entropy returns the MEAN over this micro-batch's B*T tokens.
+		# Summing 16 such gradients would give 16x the gradient of one big batch, whose
+		# loss would be the mean over ALL 32768 tokens. Dividing each micro-loss by
+		# grad_accum turns the sum into that mean:
+		#   (1/16) * (mean_1 + mean_2 + ... + mean_16) = mean over all 32768 tokens
+		# Since gradients are linear, scaling the loss scales its gradient the same way.
+		loss = loss / grad_accum
+		# Add up the (already scaled) loss so the printed value is the full-batch mean.
+		# .detach() returns the same value cut off from the computation graph: we only
+		# want the number. Without it, loss_accum would keep linking to every micro-step's
+		# graph, wasting memory.
+		loss_accum += loss.detach()
+		# Backprop: walk the computation graph backwards from loss and ADD
+		# d(loss)/d(param) into .grad for EVERY parameter: "which direction makes the loss
+		# go UP". The graph for this micro-batch is freed afterwards, so memory stays at
+		# one micro-batch's worth no matter how large grad_accum is.
+		loss.backward()
+	# Everything from here runs ONCE per optimizer step, on the accumulated gradients.
 	# GRADIENT CLIPPING. Treat ALL gradients of ALL parameters as one long vector and
 	# compute its length (global L2 norm):  norm = sqrt(sum over every grad element of g^2)
 	# If norm > 1.0, scale every gradient by 1.0 / norm so the total length becomes 1.0.
@@ -732,20 +784,23 @@ for step in range(max_steps):
 	# GPU work is ASYNCHRONOUS: Python only queues kernels and moves on, so without this
 	# t1 would be taken before the GPU actually finished the step. synchronize() makes
 	# the CPU wait until all queued GPU work is done -> the timing is real.
-	# (CUDA equivalent: torch.cuda.synchronize(). This line is mps-only, so it will fail
-	#  when device is 'cuda' or 'cpu'.)
-	torch.mps.synchronize()
+	# Each backend has its own synchronize(); CPU work is already synchronous.
+	if device == 'cuda':
+		torch.cuda.synchronize()
+	elif device == 'mps':
+		torch.mps.synchronize()
 	t1 = time.time()
 	# Step duration in MILLISECONDS (time.time() is in seconds; * 1000).
-	# NOTE: the print below labels it 's', but the value is ms.
 	step_time = (t1-t0)*1000
-	# Throughput: tokens processed per step / time. The best number for comparing speed-ups.
-	# NOTE: dividing by step_time (ms) gives tokens per MILLISECOND; for tokens per second
-	# divide by (t1 - t0) instead.
-	tps = (train_dataloader.B * train_dataloader.T) / step_time
+	# Throughput: tokens processed per SECOND. The best number for comparing speed-ups.
+	# One optimizer step now processes B * T * grad_accum = 32768 tokens, hence * grad_accum.
+	# Divide by the duration in seconds (t1 - t0), not by step_time (ms).
+	tps = (train_dataloader.B * train_dataloader.T * grad_accum) / (t1 - t0)
 	# Expect ~10.8 at step 0 (= ln(50304), random guessing), dropping over the steps.
 	# Format specs like :.5f print the 0-dim tensors as plain numbers with 5 decimals.
-	print(f'step: {step} | loss: {loss:.5f} | lr: {lr:.5f} | norm: {norm:.4f} | step time: {step_time:.2f}s | tps: {tps:.2f}')
+	# loss_accum (not loss): loss is only the LAST micro-batch's value divided by 16;
+	# loss_accum is the mean over the whole 32768-token batch.
+	print(f'step: {step} | loss: {loss_accum:.5f} | lr: {lr:.5f} | norm: {norm:.4f} | step time: {step_time:.2f}ms | tps: {tps:.2f}')
 
 # Stop the script here, so the generation code below doesn't run (temporarily disabled).
 import sys; sys.exit(0)
@@ -815,9 +870,8 @@ while x.size(1) < max_tokens:
 	# Saves a lot of memory and some time. (torch.inference_mode() is a bit faster still.)
 	with torch.no_grad():
 		# Next-token scores for EVERY position.
-		# NOTE: forward now returns (logits, loss), so this line needs to become
-		# `logits, _ = model(x)` before generation will work again.
-		logits = model(x) # (B, T, vocab_size)                    e.g. (5, 7, 50257)
+		# forward returns (logits, loss); loss is None without targets, so discard it.
+		logits, _ = model(x) # (B, T, vocab_size)                    e.g. (5, 7, 50257)
 
 		# Keep only the LAST position: the other T-1 predictions are guesses for
 		# tokens we already have. Integer index -1 (not a slice) DROPS the T dim.
