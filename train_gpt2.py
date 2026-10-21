@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import math
-import time
-import inspect
+import time     # wall-clock timing of each training step
+import inspect  # look at a function's signature (used to check if AdamW supports fused=)
 import tiktoken
 import torch
 import torch.nn as nn
@@ -230,6 +230,20 @@ class CausalSelfAttention(nn.Module):
 		# #   y[b,h,i,:] = sum_j attn[b,h,i,j] * v[b,h,j,:]
 		# #   e.g. token 1 gets 0.29*v_0 + 0.71*v_1
 		# y = attn @ v  # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)   (2, 2, 4, 4)
+
+		# FLASH ATTENTION: the 4 commented-out steps above (scores, scale, mask, softmax,
+		# weighted sum) in ONE fused call. Same math, same result:
+		#   q, k, v: (B, nh, T, hs)  ->  y: (B, nh, T, hs)
+		#   - scales by 1/sqrt(hs) itself (default scale = 1/sqrt(q.size(-1)))
+		#   - is_causal=True applies the lower-triangular mask itself, so the "bias"
+		#     buffer is no longer used here
+		# Why faster: the manual version WRITES the full (B, nh, T, T) attention matrix
+		# to GPU memory and reads it back for every step (mask, softmax, @ v). Memory
+		# traffic, not math, is the bottleneck. FlashAttention processes q/k/v in tiles
+		# that fit in fast on-chip memory and uses an "online softmax" (running max +
+		# running sum) so the TxT matrix is never stored in full. More FLOPs, much less
+		# memory traffic -> faster, and memory grows ~T instead of ~T^2.
+		# PyTorch picks the best kernel for the device (flash / memory-efficient / math).
 		y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
 		# Merge heads back (reverse of the split above).
@@ -378,24 +392,60 @@ class GPT(nn.Module):
 
 
 	def configure_optimizer(self, weight_decay, learning_rate, device):
+		"""
+		Build AdamW with WEIGHT DECAY applied only to the 2-D+ weight tensors.
+
+		INTUITION
+		  Weight decay pulls every decayed weight a little toward 0 each step
+		  (AdamW: p -= lr * weight_decay * p, separately from the gradient update).
+		  It's a regularizer: no single weight can grow huge, so the model has to spread
+		  what it learns across many weights instead of relying on a few.
+		  - Decay:    matmul weights and embeddings (2-D) -> most of the parameters.
+		  - No decay: biases and LayerNorm gains/biases (1-D) -> pulling a LayerNorm
+		              gain toward 0 would just shrink activations, which isn't useful.
+		"""
+		# name -> parameter, e.g. 'transformer.h.0.attn.c_attn.weight' -> tensor (2304, 768)
+		# named_parameters() lists a SHARED tensor once, so the tied wte/lm_head weight
+		# appears once (under 'transformer.wte.weight').
+		# NOTE: this reads the GLOBAL `model`, not `self`. It works only because a global
+		# `model` happens to exist; `self.named_parameters()` is what's meant.
 		param_dict = {pn:p for pn, p in model.named_parameters()}
+		# Keep only trainable parameters (frozen ones have requires_grad=False).
 		param_dict = {pn:p for pn, p in param_dict.items() if p.requires_grad}
 
+		# p.dim() = number of dimensions.
+		#   >= 2: Linear weights (out, in), Embedding weights (V, C)    -> decay
+		#   <  2: Linear biases (out,), LayerNorm weight/bias (C,)      -> no decay
 		decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
 		no_decay_params = [p for _, p in param_dict.items() if p.dim() < 2]
 
+		# PARAMETER GROUPS: an optimizer can take a list of dicts instead of one list of
+		# params; each dict is a group with its own settings (here: its own weight_decay).
+		# Settings missing from a group (lr, betas, ...) come from the AdamW(...) arguments.
 		optim_groups = [
 			{'params': decay_params, 'weight_decay': weight_decay},
 			{'params': no_decay_params, 'weight_decay': 0.0}
 		]
+		# p.numel() = total number of elements in the tensor, e.g. (2304, 768) -> 1,769,472
 		num_decay_params = sum(p.numel() for p in decay_params)
 		num_nondecay_params = sum(p.numel() for p in no_decay_params)
 		print(f'num decayed param tensor: {len(decay_params)} with parms: {num_decay_params}')
 		print(f'num non decay param tensors: {len(no_decay_params)} with params: {num_nondecay_params}')
 
+		# FUSED ADAMW: the default AdamW loops over parameter tensors and launches several
+		# small GPU kernels for each. fused=True does the update for all of them in one
+		# kernel, which is faster. It exists only on newer PyTorch versions, so check the
+		# constructor's signature: inspect.signature(fn).parameters = its argument names.
 		fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+		# Only turned on for CUDA here, so it's False on mps/cpu.
 		use_fused = fused_available and 'cuda' in device
 		print(f'using fused AdamW: {use_fused}')
+		# betas=(0.9, 0.95): decay rates of Adam's running averages of the gradient (0.9)
+		#   and the squared gradient (0.95). PyTorch's default for the second is 0.999;
+		#   GPT-3 used 0.95, which reacts faster to changes in gradient size.
+		# eps=1e-8: added to the denominator so Adam never divides by ~0.
+		# lr=learning_rate is only the starting value; the training loop overwrites the
+		# lr of every group each step (cosine schedule, see get_lr).
 		optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
 		return optimizer
 
@@ -533,54 +583,107 @@ class GPT(nn.Module):
 #   change to reduce that loss (backprop), and nudge every weight a little (optimizer).
 #
 # RECIPE (memorize this; the order inside the loop matters)
-#   x, y = next_batch() -> .to(device) -> zero_grad() -> logits, loss = model(x, y)
-#        -> loss.backward() -> optimizer.step()
+#   x, y = next_batch() -> .to(device) -> zero_grad()
+#        -> with autocast: logits, loss = model(x, y)
+#        -> loss.backward() -> clip_grad_norm_ -> set lr from schedule -> optimizer.step()
+#        -> synchronize -> time it
 #
-# Shapes:  B = 4, T = 32  ->  x, y: (4, 32),  logits: (4, 32, 50257),  loss: scalar
+# SPEED-UPS used here (same math, faster on the hardware)
+#   - vocab_size 50304 instead of 50257 ("nice" number for GPU kernels)
+#   - torch.compile                       (fuses ops, fewer memory round trips)
+#   - set_float32_matmul_precision('high')  (TF32 matmuls on NVIDIA GPUs)
+#   - autocast to bfloat16                (half-size numbers in the forward pass)
+#   - F.scaled_dot_product_attention      (FlashAttention, in CausalSelfAttention)
+#   - fused AdamW                         (CUDA only, in configure_optimizer)
+#
+# TRAINING STABILITY (from the GPT-3 paper's settings)
+#   - AdamW betas=(0.9, 0.95), weight decay 0.1 on 2-D weights only
+#   - gradient clipping at norm 1.0
+#   - learning rate: linear warmup, then cosine decay to 10% of max
+#
+# Shapes:  B = 8, T = 256  ->  x, y: (8, 256),  logits: (8, 256, 50304),  loss: scalar
 # =============================================================================
 
 # Build our GPT with GPT-2 small sizes (124M params) and RANDOM weights (_init_weights).
 # The commented line would instead load OpenAI's trained GPT-2 weights.
 # model = GPT.from_pretrained('gpt2')
+# vocab_size=50304 instead of GPT-2's 50257: a "nice" number, 50304 = 128 * 393.
+# GPU kernels work in blocks that are powers of 2; an ugly size like 50257 forces
+# extra, slower work for the leftover edge. The 47 extra tokens never appear in the
+# data, so the model simply learns to give them ~0 probability. More params, yet faster.
 model = GPT(GPTConfig(vocab_size=50304))
 # For a MODULE, .to() moves parameters + buffers IN PLACE (and returns self), so no
 # reassignment needed. For a TENSOR, .to() returns a NEW tensor (see x, y below).
 model.to(device)
+# torch.compile: analyzes the whole model's Python code once and generates optimized
+# kernels for it. Main win is KERNEL FUSION: in eager mode every op (add, multiply,
+# gelu, ...) reads its input from GPU memory and writes its output back; fused ops
+# keep intermediates on-chip and do several ops in one trip.
+# The FIRST step is slow (compiling); later steps are faster.
+# Returns a wrapper (OptimizedModule): calls and attribute access (like
+# model.configure_optimizer) are forwarded to the original model, but state_dict
+# keys get an '_orig_mod.' prefix.
 model = torch.compile(model)
 
-# 4 sequences of 32 tokens per step = 128 next-token predictions per batch.
+# 8 sequences of 256 tokens per step = 2048 next-token predictions per batch.
 train_dataloader = DataLoaderLite(B=8, T=256)
+# Default precision for float32 matmuls is 'highest' (true fp32). 'high' allows TF32 on
+# NVIDIA GPUs (Ampere and newer): same 8-bit exponent (same range), 10-bit mantissa
+# (less precision), much faster tensor-core matmuls. Mostly a CUDA setting.
 torch.set_float32_matmul_precision('high')
 
-# AdamW = Adam with "decoupled" weight decay (default weight_decay=0.01).
-#   Adam keeps, per parameter, a running mean of gradients (momentum) and of squared
-#   gradients, and scales each update by them, so every weight gets its own effective
-#   step size. Much faster than plain SGD for transformers.
-# model.parameters(): every trainable tensor (the tied wte/lm_head weight counted once;
-# buffers like the causal mask are NOT included).
-# lr=3e-4: a safe default for small/medium transformers.
-
-max_lr = 6e-4
-min_lr = 0.1 * 6e-4
+# LEARNING RATE SCHEDULE (GPT-3 style): warmup, then cosine decay.
+#
+#   lr
+#   6e-4 |        ___
+#        |      /     ‾‾--_
+#        |    /             ‾-_
+#        |  /                  ‾--__
+#   6e-5 |/                         ‾‾‾‾‾‾  min_lr
+#        +--------------------------------> step
+#        0    10 (warmup_steps)      50 (max_steps)
+#
+# Why warmup: at the start weights are random and gradients are large and noisy.
+#   Adam's running averages are also still empty. Big steps now can throw the model
+#   into a bad region, so start tiny and ramp up.
+# Why decay: early on, big steps make fast progress. Later, near a good solution,
+#   big steps keep overshooting it; smaller steps let the loss settle lower.
+max_lr = 6e-4           # peak learning rate (GPT-3 small's value)
+min_lr = 0.1 * 6e-4     # floor = 10% of max (6e-5)
 warmup_steps = 10
 max_steps = 50
 def get_lr(step):
+	# 1) Linear warmup: step 0 -> max_lr/10 = 6e-5, ..., step 9 -> max_lr = 6e-4.
+	#    (step+1) so step 0 doesn't get lr = 0, which would waste a step.
 	if step < warmup_steps:
 		return (max_lr * (step+1)) / warmup_steps
+	# 2) After the schedule ends: stay at the floor.
+	#    (The loop runs step 0..max_steps-1, so this branch never runs here.)
 	elif step > max_steps:
 		return min_lr
+	# 3) Cosine decay from max_lr down to min_lr.
 	else:
+		# How far through the decay phase we are: 0.0 at step 10 -> 1.0 at step 50.
 		decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
 		assert 0 <= decay_ratio <= 1
+		# cos goes from 1 (at 0) to -1 (at pi), so coeff goes smoothly 1.0 -> 0.0:
+		#   decay_ratio 0.0 -> coeff 1.0,  0.5 -> 0.5,  1.0 -> 0.0
 		coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+		# Blend: coeff=1 -> max_lr, coeff=0 -> min_lr.
 		return min_lr + coeff * (max_lr - min_lr)
 
 
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+# AdamW = Adam with "decoupled" weight decay.
+#   Adam keeps, per parameter, a running mean of gradients (momentum) and of squared
+#   gradients, and scales each update by them, so every weight gets its own effective
+#   step size. Much faster than plain SGD for transformers.
+# configure_optimizer adds weight decay groups + fused kernel; see its docstring.
 optimizer = model.configure_optimizer(weight_decay=0.1, learning_rate=6e-4, device=device)
 for step in range(max_steps):
+	# Start the stopwatch for this step (seconds since 1970, as a float).
 	t0 = time.time()
-	# A fresh batch each step: next 128 consecutive (input, target) pairs from the text.
+	# A fresh batch each step: next 2048 consecutive (input, target) pairs from the text.
 	x, y = train_dataloader.next_batch()  # (B, T), (B, T) on CPU
 	# Tensor .to() is NOT in place, so reassign. Data must be on the model's device.
 	x, y = x.to(device), y.to(device)
@@ -588,26 +691,60 @@ for step in range(max_steps):
 	# this step's gradient would be added to all previous ones. So clear them first.
 	optimizer.zero_grad()
 	# Forward pass: predictions for all B*T positions and the mean cross-entropy loss.
+	# MIXED PRECISION with torch.autocast: inside this block, ops that are safe in lower
+	# precision (matmuls, i.e. Linear layers and attention) run in bfloat16; ops that
+	# need precision (softmax, LayerNorm, the loss) stay in float32. Autocast decides
+	# per op. The PARAMETERS stay float32; only the computations are cast.
+	#   float32:  1 sign, 8 exponent, 23 mantissa bits
+	#   bfloat16: 1 sign, 8 exponent,  7 mantissa bits
+	# Same exponent = same RANGE as fp32 (no overflow/underflow), just less precision.
+	# Half the bytes -> half the memory traffic and much faster matmul hardware.
+	# (float16 has only 5 exponent bits, so it needs a GradScaler to avoid tiny
+	#  gradients rounding to 0; bfloat16 doesn't.)
+	# Only the forward pass goes inside; backward runs outside and uses matching dtypes.
+	# logits come out as bfloat16.
 	with torch.autocast(device_type=device, dtype=torch.bfloat16):
 		logits, loss = model(x, y)  # (B, T, V), scalar
 	# Backprop: walk the computation graph backwards from loss and fill .grad for
 	# EVERY parameter with d(loss)/d(param): "which direction makes the loss go UP".
 	loss.backward()
+	# GRADIENT CLIPPING. Treat ALL gradients of ALL parameters as one long vector and
+	# compute its length (global L2 norm):  norm = sqrt(sum over every grad element of g^2)
+	# If norm > 1.0, scale every gradient by 1.0 / norm so the total length becomes 1.0.
+	# The DIRECTION of the update is kept; only its size is capped.
+	# Why: an unlucky batch can give a huge gradient that would shove the model far off
+	# course in one step. Clipping limits the damage.
+	# Returns the norm BEFORE clipping: useful to watch. High at the start is normal;
+	# it should settle. Sudden spikes later = instability.
+	# Must be between backward() (grads exist) and step() (grads used).
 	norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
+	# Set this step's learning rate from the schedule. The optimizer has no idea about
+	# the schedule; it just reads the 'lr' key of each param group in step(), so we
+	# overwrite it in both groups (decay and no-decay) every step.
+	# (torch.optim.lr_scheduler does the same thing for you.)
 	lr = get_lr(step)
 	for param_grp in optimizer.param_groups:
 		param_grp['lr'] = lr
 	# Update every parameter using its .grad (AdamW rule; roughly param -= lr * step),
 	# i.e. move each weight a little in the direction that makes the loss go DOWN.
 	optimizer.step()
-	# Expect ~10.8 at step 0 (= ln(50257), random guessing), dropping over 50 steps.
-	# Printing the tensor shows device + grad_fn too; loss.item() gives a plain float
-	# (and forces the GPU to finish, which is what you want when timing steps).
+	# GPU work is ASYNCHRONOUS: Python only queues kernels and moves on, so without this
+	# t1 would be taken before the GPU actually finished the step. synchronize() makes
+	# the CPU wait until all queued GPU work is done -> the timing is real.
+	# (CUDA equivalent: torch.cuda.synchronize(). This line is mps-only, so it will fail
+	#  when device is 'cuda' or 'cpu'.)
 	torch.mps.synchronize()
 	t1 = time.time()
+	# Step duration in MILLISECONDS (time.time() is in seconds; * 1000).
+	# NOTE: the print below labels it 's', but the value is ms.
 	step_time = (t1-t0)*1000
+	# Throughput: tokens processed per step / time. The best number for comparing speed-ups.
+	# NOTE: dividing by step_time (ms) gives tokens per MILLISECOND; for tokens per second
+	# divide by (t1 - t0) instead.
 	tps = (train_dataloader.B * train_dataloader.T) / step_time
+	# Expect ~10.8 at step 0 (= ln(50304), random guessing), dropping over the steps.
+	# Format specs like :.5f print the 0-dim tensors as plain numbers with 5 decimals.
 	print(f'step: {step} | loss: {loss:.5f} | lr: {lr:.5f} | norm: {norm:.4f} | step time: {step_time:.2f}s | tps: {tps:.2f}')
 
 # Stop the script here, so the generation code below doesn't run (temporarily disabled).
